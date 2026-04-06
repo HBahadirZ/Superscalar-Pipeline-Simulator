@@ -7,6 +7,8 @@
 #include <sstream>
 #include <deque>
 #include <unordered_map>
+#include <climits>
+#include <algorithm>
 using namespace std;
 
 // SHARED: Instruction
@@ -80,11 +82,16 @@ struct SimulationResult{
 void printStats(const SimulationResult& r) {
     long long total = r.count_int + r.count_fp + r.count_branch + r.count_load + r.count_store;
     cout << "Total Cycles: " << r.totalCycles << endl;
-    cout << "Execution Time (in ms): " <<r.execution_time_in_ms<< endl;
+    cout << "Execution Time (in ms): " << r.execution_time_in_ms << endl;
     cout << "Instruction Histogram: " << endl;
-
-
-    // Todo: printing percentages for each type
+    if (total == 0) {
+        cout << "%Int: 0%" << endl;
+        cout << "%FP: 0%" << endl;
+        cout << "%Branch: 0%" << endl;
+        cout << "%Load: 0%" << endl;
+        cout << "%Store: 0%" << endl;
+        return;
+    }
     cout << "%Int: " << (100.0 * r.count_int / total) << "%" << endl;
     cout << "%FP: " << (100.0 * r.count_fp / total) << "%" << endl;
     cout << "%Branch: " << (100.0 * r.count_branch / total) << "%" << endl;
@@ -147,51 +154,241 @@ public:
     // Then return performance metrics for this run
     SimulationResult run(TraceReader& reader, long long instruction_count) {
         SimulationResult result;
-        long long cycle=0;
-
-        // Active instructions in the pipeline
-        deque<Instruction*> pipeline;
-
-        // Dependency map: PC -> cycle when that instruction's
-        // data dependency becomes satisfied
-        // INT/FP/Branch: satisfied after EX (cycle_EX_done)
-        // Load/Store: satisfied after MEM (cycle_MEM_done)
-        // Updated by Huseyin each time an instruction retires a stage
         dep_ready.clear();
 
-        long long retired_instruction = 0;
+        if (instruction_count <= 0) {
+            result.totalCycles = 0;
+            result.execution_time_in_ms = 0;
+            return result;
+        }
 
-        // Todo: main simulation loop
-        // Won
-        // Structure:
-        // while(retired < instruction_count):
-        // 1.Fetch up to 2 new instructions (if no branch stall)
-        // 2.Advance pipeline: try to move each instruction forward
-        // -Check structural hazard before EX
-        // -Check control hazard before IF
-        // -Check data hazard before EX(Huseyin)
-        // -Check extended EX/MEM cycles(Huseyin)
-        // 3.Retire instructions that finished WB then update dep_ready
-        // 4.Increment cycle
+        deque<Instruction*> q;
+        long long retired = 0;
+        long long fetched = 0;
+        long long cycle = 0;
+        // Loose cap so we never spin forever if TraceReader is empty or logic regresses
+        const long long cycle_cap = instruction_count * 25LL + 10000000LL;
 
+        while (retired < instruction_count) {
+            if (cycle > cycle_cap) {
+                cerr << "Simulator: cycle limit exceeded (check TraceReader / hazards)\n";
+                break;
+            }
 
-        // Just placeholders (remove later)
-        (void)reader;
-        (void)instruction_count;
-        (void)cycle;
-        (void)pipeline;
-        (void)retired_instruction;
+            // --- control hazard: stall fetch while any branch has not finished EX ---
+            bool fetch_stall = false;
+            for (Instruction* x : q) {
+                if (x->type != 3) continue;
+                if (x->pipeline_stage < 2) {
+                    fetch_stall = true;
+                    break;
+                }
+                if (x->pipeline_stage == 2 && cycle <= x->cycle_EX_done) {
+                    fetch_stall = true;
+                    break;
+                }
+            }
 
+            // --- retire WB (oldest at front); PDF: Nth completes WB ---
+            while (!q.empty() && q.front()->pipeline_stage == 4 && cycle > q.front()->cycle_WB) {
+                Instruction* r = q.front();
+                q.pop_front();
+                switch (r->type) {
+                    case 1: result.count_int++; break;
+                    case 2: result.count_fp++; break;
+                    case 3: result.count_branch++; break;
+                    case 4: result.count_load++; break;
+                    case 5: result.count_store++; break;
+                    default: break;
+                }
+                delete r;
+                retired++;
+                if (retired >= instruction_count) break;
+            }
+            if (retired >= instruction_count) {
+                cycle++;
+                break;
+            }
+
+            // --- MEM -> WB (max 2), in-order: any older inst still in MEM blocks ---
+            int moved = 0;
+            for (size_t i = 0; i < q.size() && moved < 2; ++i) {
+                Instruction* in = q[i];
+                if (in->pipeline_stage != 3) continue;
+                if (cycle <= in->cycle_MEM_done) continue;
+                bool blocked = false;
+                for (size_t j = 0; j < i; ++j) {
+                    if (q[j]->pipeline_stage == 3) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+                in->pipeline_stage = 4;
+                in->cycle_WB = cycle;
+                in->cycle_WB_done = cycle;
+                moved++;
+            }
+
+            // --- EX -> MEM (max 2), structural load/store ports ---
+            moved = 0;
+            for (size_t i = 0; i < q.size() && moved < 2; ++i) {
+                Instruction* in = q[i];
+                if (in->pipeline_stage != 2) continue;
+                if (cycle <= in->cycle_EX_done) continue;
+                bool blocked = false;
+                for (size_t j = 0; j < i; ++j) {
+                    if (q[j]->pipeline_stage == 2) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+
+                auto load_port_busy = [&]() {
+                    for (Instruction* x : q)
+                        if (x->type == 4 && x->pipeline_stage == 3 && cycle <= x->cycle_MEM_done)
+                            return true;
+                    return false;
+                };
+                auto store_port_busy = [&]() {
+                    for (Instruction* x : q)
+                        if (x->type == 5 && x->pipeline_stage == 3 && cycle <= x->cycle_MEM_done)
+                            return true;
+                    return false;
+                };
+                if (in->type == 4 && load_port_busy()) continue;
+                if (in->type == 5 && store_port_busy()) continue;
+
+                int mem_lat = (in->type == 4) ? config.MEM_cycles_load : 1;
+                long long mem_done = cycle + mem_lat - 1;
+                if (config.D == 3 || config.D == 4) {
+                    for (size_t j = 0; j < i; ++j) {
+                        Instruction* o = q[j];
+                        if (o->pipeline_stage == 3 && o->type == 4 && in->type != 4)
+                            mem_done = max(mem_done, o->cycle_MEM_done);
+                    }
+                }
+
+                in->pipeline_stage = 3;
+                in->cycle_MEM = cycle;
+                in->cycle_MEM_done = mem_done;
+                if (in->type == 4 || in->type == 5)
+                    dep_ready[in->pc] = mem_done + 1;
+                moved++;
+            }
+
+            // --- ID -> EX (max 2) ---
+            moved = 0;
+            for (size_t i = 0; i < q.size() && moved < 2; ++i) {
+                Instruction* in = q[i];
+                if (in->pipeline_stage != 1) continue;
+                if (cycle <= in->cycle_ID) continue;
+                bool blocked = false;
+                for (size_t j = 0; j < i; ++j) {
+                    if (q[j]->pipeline_stage == 1) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+
+                bool data_ok = true;
+                for (unsigned long long dpc : in->dep_pcs) {
+                    auto it = dep_ready.find(dpc);
+                    if (it != dep_ready.end() && cycle < it->second) {
+                        data_ok = false;
+                        break;
+                    }
+                }
+                if (!data_ok) continue;
+
+                auto fu_busy = [&](int typ) {
+                    for (Instruction* x : q) {
+                        if (x->pipeline_stage != 2) continue;
+                        if (x->type != typ) continue;
+                        if (cycle <= x->cycle_EX_done) return true;
+                    }
+                    return false;
+                };
+                if (in->type == 1 && fu_busy(1)) continue;
+                if (in->type == 2 && fu_busy(2)) continue;
+                if (in->type == 3 && fu_busy(3)) continue;
+
+                int ex_lat = (in->type == 2) ? config.EX_cycles_fp_inst : 1;
+                long long ex_done = cycle + ex_lat - 1;
+                if (config.D == 2 || config.D == 4) {
+                    for (size_t j = 0; j < i; ++j) {
+                        Instruction* o = q[j];
+                        if (o->pipeline_stage == 2 && o->type == 2 && in->type != 2)
+                            ex_done = max(ex_done, o->cycle_EX_done);
+                    }
+                }
+
+                in->pipeline_stage = 2;
+                in->cycle_EX = cycle;
+                in->cycle_EX_done = ex_done;
+                if (in->type <= 3)
+                    dep_ready[in->pc] = ex_done + 1;
+                else
+                    dep_ready[in->pc] = LLONG_MAX;
+                moved++;
+            }
+
+            // --- IF -> ID (max 2) ---
+            moved = 0;
+            for (size_t i = 0; i < q.size() && moved < 2; ++i) {
+                Instruction* in = q[i];
+                if (in->pipeline_stage != 0) continue;
+                if (cycle <= in->cycle_IF) continue;
+                bool blocked = false;
+                for (size_t j = 0; j < i; ++j) {
+                    if (q[j]->pipeline_stage == 0) {
+                        blocked = true;
+                        break;
+                    }
+                }
+                if (blocked) continue;
+                in->pipeline_stage = 1;
+                in->cycle_ID = cycle;
+                moved++;
+            }
+
+            // --- fetch ---
+            if (!fetch_stall && fetched < instruction_count) {
+                int fcnt = 0;
+                while (fcnt < 2 && fetched < instruction_count && reader.hasNext()) {
+                    Instruction* ni = new Instruction(reader.next());
+                    ni->pipeline_stage = 0;
+                    ni->cycle_IF = cycle;
+                    q.push_back(ni);
+                    fetched++;
+                    fcnt++;
+                    if (ni->type == 3) break;
+                }
+            }
+
+            // Deadlock / empty trace: no progress possible
+            if (q.empty() && retired < instruction_count && !reader.hasNext()) break;
+
+            cycle++;
+        }
+
+        result.totalCycles = cycle;
+        result.execution_time_in_ms =
+            static_cast<double>(cycle) / (config.frequency_in_ghz * 1e6);
+        // Clean up if we exited early
+        while (!q.empty()) {
+            delete q.front();
+            q.pop_front();
+        }
         return result;
     }
 
 private:
     pipelineConfiguration config;
 
-
-    // Dependency map (see comments in run())
-    // Key: instruction PC
-    // value: earliest cycle at which a dependent instruction may enter EX
+    // dep_ready[producer_pc] = earliest cycle a dependent may enter EX
     unordered_map<unsigned long long, long long> dep_ready;
 };
 
