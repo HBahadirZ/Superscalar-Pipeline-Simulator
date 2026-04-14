@@ -12,7 +12,7 @@
 #include <algorithm>
 using namespace std;
 
-// SHARED: Instruction
+// Instruction struct to store the information of an instruction
 struct Instruction {
     unsigned long long pc; // instruction address (hex in trace)
     int type; // 1:Int  2:FP  3:Branch  4:Load  5:Store
@@ -22,33 +22,28 @@ struct Instruction {
     // 0:IF 1:ID 2:EX 3:MEM 4:WB 5:Retired
     int pipeline_stage = 0;
 
-    // Cycle when instruction ENTERS each stage (-1 = not yet reached)
+    // Cycle when instruction enters each stage (-1 = not yet reached)
     long long cycle_IF  = -1;
     long long cycle_ID  = -1;
     long long cycle_EX  = -1;
     long long cycle_MEM = -1;
     long long cycle_WB  = -1;
 
-    // Cycle when EX and MEM stages ends
-    // instructions in general; cycle_EX_done = cycle_EX (1-cycle EX)
-    // cycle_MEM_done = cycle_MEM (1-cycle MEM)
-    // D2/D4 FP instructions; cycle_EX_done = cycle_EX + 1 (2-cycle EX)
-    // D3/D4 Load instructions; cycle_MEM_done = cycle_MEM + 2 (3-cycle MEM)
+    // Cycle when instruction finishes each stage (-1 = not yet finished)
     long long cycle_EX_done  = -1;
     long long cycle_MEM_done = -1;
-    long long cycle_WB_done  = -1; // retire cycle;simulation end when last inst retires
+    long long cycle_WB_done  = -1; // retire cycle; simulation ends when the last instruction retires
 };
 
-// SHARED: pipelineConfiguration (to Encodes the D1/D2/D3/D4 pipeline depth parameters)
+// pipelineConfiguration struct to store the configuration of the pipeline
 struct pipelineConfiguration {
     int D; // pipeline depth level: 1, 2, 3, or 4
-    int EX_cycles_fp_inst;// EX stage cycles for FP instructions (D1/D3:1, D2/D4:2)
-    int MEM_cycles_load;// MEM stage cycles for Load instructions (D1/D2:1, D3/D4:3)
-    double frequency_in_ghz; // processor frequency (D1:1, D2:1.2, D3:1.7, D4:1.8)
+    int EX_cycles_fp_inst; // EX stage cycles for FP instructions (D1/D3:1, D2/D4:2)
+    int MEM_cycles_load; // MEM stage cycles for Load instructions (D1/D2:1, D3/D4:3)
+    double frequency_in_ghz; // processor frequency (D1:1.0 GHz, D2:1.2 GHz, D3:1.7 GHz, D4:1.8 GHz)
 };
 
 // Returns the correct pipelineConfiguration for a given D value.
-// Huseyin
 pipelineConfiguration makeConfig(int D) {
     pipelineConfiguration pipConfig;
     pipConfig.D = D;
@@ -62,15 +57,14 @@ pipelineConfiguration makeConfig(int D) {
     return pipConfig;
 }
 
-// SHARED: SimulationResult
-// Returned by Simulator::run() printed by printStats()
-// Huseyin
+// SimulationResult struct to store the results of the simulation
 struct SimulationResult {
-    long long totalCycles = 0;
-    double execution_time_in_ms = 0;
+    long long totalCycles = 0; // total cycles of the simulation
+    double execution_time_in_ms = 0; // execution time of the simulation in milliseconds
+    bool completed = false; // true only if the requested instruction count retired successfully
 
-    // Retired instruction counts by different types
-    long long count_int= 0;
+    // Retired instruction counts by different types: integer, floating-point, branch, load, store
+    long long count_int= 0; 
     long long count_fp = 0;
     long long count_branch = 0;
     long long count_load = 0;
@@ -78,7 +72,6 @@ struct SimulationResult {
 };
 
 // Prints simulation stats to stdout.
-// Huseyin
 void printStats(const SimulationResult& r) {
     long long total = r.count_int + r.count_fp + r.count_branch + r.count_load + r.count_store;
     cout << "Total Cycles: " << r.totalCycles << endl;
@@ -101,7 +94,6 @@ void printStats(const SimulationResult& r) {
 
 // TraceReader to parse the instruction trace file one instruction at a time
 // Seeks to start_instruction on construction
-// Won
 class TraceReader {
 public:
     TraceReader(const string& path,long long start_instruction) {
@@ -122,10 +114,14 @@ public:
         if (file.is_open()) file.close();
     }
 
-    // Returns true if there is at least one more inst to read
+    // Returns true if there is at least one more instruction to read
     bool hasNext() {
         // peek() returns EOF only when the stream has no more char
         return file.is_open() && file.peek() != EOF;
+    }
+
+    bool isOpen() const {
+        return file.is_open();
     }
 
     // Parses and returns the next instruction from the trace
@@ -133,17 +129,17 @@ public:
         Instruction inst;
         string line;
 
-        // Skip blank lines
+        // Skip blank lines and get the next line
         while (getline(file, line)) {
             if (!line.empty() && line.back()=='\r') line.pop_back();
             if (!line.empty()) break;
         }
-        if (line.empty()) return inst; // EOF or only blank remain
+        if (line.empty()) return inst; // EOF or only blank lines remain
 
         stringstream ss(line);
         string token;
 
-        // Field1: instruction PC (hex)
+        // Field1: instruction PC (hexadecimal)
         if (getline(ss, token, ','))
             inst.pc = stoull(token, nullptr, 16);
 
@@ -164,28 +160,20 @@ private:
     ifstream file;
 };
 
-// Simulator: 2-wide superscalar in-order pipeline.
-//
-// Won:
-// - pipeline loop
-// - structural hazard detection
-// - control hazard detection
-//
-// Huseyin:
-// - data hazard detection (dep_ready map lookups)
-// - extended EX/MEM stage logic for D2/D3/D4
-// - result tallying and execution time calculation
+// Simulator: 2-wide superscalar in-order pipeline
+// Simulates the pipeline and returns the results of the simulation
 class Simulator {
 public:
     Simulator(const pipelineConfiguration& config) : config(config) {}
 
     // Simulate exactly instruction_count instructions from reader
-    // Then return performance metrics for this run
+    // Then return the results of the simulation
     SimulationResult run(TraceReader& reader, long long instruction_count) {
         SimulationResult result;
         dep_ready.clear();
 
-        if (instruction_count<=0){
+        if (instruction_count <= 0) {
+            result.completed = true;
             return result;
         }
 
@@ -202,7 +190,7 @@ public:
                 break;
             }
 
-            // ---- Control hazard: stall fetch while any branch hasn't finished EX ----
+            // Control hazard: stall fetch while any branch hasn't finished EX
             bool fetch_stall = false;
             for (Instruction* x : q) {
                 if (x->type != 3) continue;
@@ -216,7 +204,7 @@ public:
                 }
             }
 
-            // --- retire WB (oldest at front); PDF: Nth completes WB ---
+            // retire WB (oldest at front); Nth instruction completes WB
             while (!q.empty() && q.front()->pipeline_stage == 4 && cycle > q.front()->cycle_WB) {
                 Instruction* r = q.front();
                 q.pop_front();
@@ -237,7 +225,7 @@ public:
                 break;
             }
 
-            // ---- MEM -> WB (up to 2 per cycle, in-order) ----
+            // MEM -> WB (up to 2 per cycle, in-order)
             int moved = 0;
             for (size_t i = 0; i < q.size() && moved < 2; ++i) {
                 Instruction* in = q[i];
@@ -257,7 +245,7 @@ public:
                 moved++;
             }
 
-            // --- EX -> MEM (max 2), structural load/store ports ---
+            // EX -> MEM (max 2), structural load/store ports
             moved = 0;
             for (size_t i = 0; i < q.size() && moved < 2; ++i) {
                 Instruction* in = q[i];
@@ -306,7 +294,7 @@ public:
                 moved++;
             }
 
-            // --- ID -> EX (max 2) ---
+            // ID -> EX (max 2)
             moved = 0;
             for (size_t i = 0; i < q.size() && moved < 2; ++i) {
                 Instruction* in = q[i];
@@ -359,7 +347,7 @@ public:
                 moved++;
             }
 
-            // --- IF -> ID (max 2) ---
+            // IF -> ID (max 2)
             moved = 0;
             for (size_t i = 0; i < q.size() && moved < 2; ++i) {
                 Instruction* in = q[i];
@@ -376,7 +364,7 @@ public:
                 moved++;
             }
 
-            // --- fetch ---
+            // fetch
             if (!fetch_stall && fetched < instruction_count) {
                 int fcnt = 0;
                 while (fcnt < 2 && fetched < instruction_count && reader.hasNext()) {
@@ -398,7 +386,8 @@ public:
 
         result.totalCycles = cycle;
         result.execution_time_in_ms = static_cast<double>(cycle) / (config.frequency_in_ghz * 1e6);
-        // Clean up if we exited early
+        result.completed = (retired >= instruction_count);
+        // Clean up if the simulation exited early
         while (!q.empty()) {
             delete q.front();
             q.pop_front(); 
@@ -411,18 +400,13 @@ private:
     pipelineConfiguration config;
 
     // dep_ready[producer_pc] = earliest cycle a dependent instruction may enter EX.
-    // INT / FP / Branch producers:set to cycle_EX_done + 1 when they enter EX
+    // Integer / Floating-point / Branch producers: set to cycle_EX_done + 1 when they enter EX
     // Load / Store producers:set to LLONG_MAX when entering EX then updated to cycle_MEM_done + 1 when entering MEM
     unordered_map<unsigned long long, long long> dep_ready;
 };
 
 // Main Function
-// Huseyin
-// Parses CLI arguments and runs one simulation
-// Running all 72 experiments for grading
-// How To Compile: make proj
-// How To Run: ./proj trace_file start_instruction instruction_count D
-// Example Usage: ./proj srv_0 10000000 1000000 2
+// Parses command line arguments and runs one simulation
 int main(int argc,char* argv[]) {
     if (argc!=5) {
         cerr << "Wrong usage!" << endl;
@@ -430,14 +414,30 @@ int main(int argc,char* argv[]) {
     }
 
     string trace_path = argv[1];
-    long long start_instruction = stoll(argv[2]); // 1-indexed instruction to start from
+    long long start_instruction = stoll(argv[2]); // 1-based index of the first instruction to simulate
     long long instruction_count = stoll(argv[3]); // number of instructions to simulate
-    int D= stoi(argv[4]); // pipeline depth config: 1,2,3, or 4
+    int D= stoi(argv[4]); // pipeline depth configuration: 1, 2, 3, or 4
+
+    if (start_instruction < 1) {
+        cerr << "Invalid start_instruction: must be >= 1" << endl;
+        return 1;
+    }
+    if (instruction_count < 0) {
+        cerr << "Invalid instruction_count: must be >= 0" << endl;
+        return 1;
+    }
 
     pipelineConfiguration config = makeConfig(D);
     TraceReader reader(trace_path,start_instruction);
+    if (!reader.isOpen()) {
+        return 1;
+    }
     Simulator sim(config);
     SimulationResult result = sim.run(reader, instruction_count);
+    if (!result.completed) {
+        cerr << "Error: trace ended before simulating requested instruction count." << endl;
+        return 1;
+    }
     printStats(result);
 
     return 0;
