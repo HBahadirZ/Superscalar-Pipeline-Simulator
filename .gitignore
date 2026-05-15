@@ -1,0 +1,25 @@
+proj
+*.o
+*.out
+*.exe
+*.obj
+
+results.csv
+
+# Local or external large traces
+compute_fp_1
+compute_int_0
+custom_trace_0
+srv_0
+
+# Personal/assignment documents
+Project description.pdf
+Report.docx
+Report.docx.pdf
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Generated test artifacts
+tests/generated_traces/*.trace
